@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bufio"
+	"bufio" // 新增：修复流式读取依赖
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -23,6 +23,12 @@ var (
 	userSessionIDHeader = "x-usersession-id"
 )
 
+// 定义独立的Delta结构体（带JSON tag），避免类型不匹配
+type Delta struct {
+	Content string `json:"content,omitempty"`
+	Role    string `json:"role,omitempty"`
+}
+
 // OpenAI标准流式响应结构
 type OpenAIStreamChunk struct {
 	ID      string `json:"id"`
@@ -30,10 +36,7 @@ type OpenAIStreamChunk struct {
 	Created int64  `json:"created"`
 	Model   string `json:"model"`
 	Choices []struct {
-		Delta struct {
-			Content string `json:"content,omitempty"`
-			Role    string `json:"role,omitempty"`
-		} `json:"delta"`
+		Delta        Delta  `json:"delta"` // 使用定义好的Delta类型
 		FinishReason string `json:"finish_reason,omitempty"`
 	} `json:"choices"`
 }
@@ -188,21 +191,18 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, model string) err
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
-				// 发送结束chunk
+				// 发送结束chunk（修复类型不匹配问题）
 				finishChunk := OpenAIStreamChunk{
 					ID:      chunkID,
 					Object:  "chat.completion.chunk",
 					Created: created,
 					Model:   model,
 					Choices: []struct {
-						Delta struct {
-							Content string `json:"content,omitempty"`
-							Role    string `json:"role,omitempty"`
-						} `json:"delta"`
+						Delta        Delta  `json:"delta"`
 						FinishReason string `json:"finish_reason,omitempty"`
 					}{
 						{
-							Delta:        struct{ Content, Role string }{},
+							Delta:        Delta{}, // 使用定义好的Delta空结构体
 							FinishReason: "stop",
 						},
 					},
@@ -231,24 +231,18 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, model string) err
 			continue
 		}
 
-		// 转换为OpenAI chunk格式
+		// 转换为OpenAI chunk格式（修复类型不匹配）
 		openAIChunk := OpenAIStreamChunk{
 			ID:      chunkID,
 			Object:  "chat.completion.chunk",
 			Created: created,
 			Model:   model,
 			Choices: []struct {
-				Delta struct {
-					Content string `json:"content,omitempty"`
-					Role    string `json:"role,omitempty"`
-				} `json:"delta"`
+				Delta        Delta  `json:"delta"`
 				FinishReason string `json:"finish_reason,omitempty"`
 			}{
 				{
-					Delta: struct {
-						Content string `json:"content,omitempty"`
-						Role    string `json:"role,omitempty"`
-					}{
+					Delta: Delta{ // 使用定义好的Delta类型赋值
 						Content: fmt.Sprintf("%v", targetChunk["content"]),
 						Role:    "assistant",
 					},
