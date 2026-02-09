@@ -1,0 +1,16 @@
+token:
+  url: "http://your-token-service.com/api/get-jwt"
+  method: "POST"
+  timeout: 5s
+
+target:
+  url: "http://your-target-service.com/api/ai-call"
+  method: "POST"
+
+default_payload:
+  user: "ai_model_user"
+  max_token: 2000
+
+server:
+  port: 8080
+  timeout: 10s
