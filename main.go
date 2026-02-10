@@ -1,29 +1,47 @@
 package main
 
 import (
-	"bufio" // 新增：修复流式读取依赖
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/spf13/viper"
 )
 
 var (
 	client = &http.Client{}
-	// 可配置Header名（修正拼写错误，若网关确实是correclation则保留）
-	correlationIDHeader = "x-correlation-id" // 建议修正为正确拼写
+	// 固定Header名
+	correlationIDHeader = "x-correlation-id"
 	userSessionIDHeader = "x-usersession-id"
+
+	// 全局配置（从环境变量读取）
+	config = struct {
+		// Token服务配置
+		TokenURL              string
+		TokenMethod           string
+		TokenTimeout          time.Duration
+		TokenPayloadTokenType string // 新增：token_type的值
+		// 目标服务配置
+		TargetURL    string
+		TargetMethod string
+		// 默认请求体参数
+		DefaultUser     string
+		DefaultMaxToken int
+		// 代理服务配置
+		ServerPort    string
+		ServerTimeout time.Duration
+	}{}
 )
 
-// 定义独立的Delta结构体（带JSON tag），避免类型不匹配
+// 定义Delta结构体（带JSON tag）
 type Delta struct {
 	Content string `json:"content,omitempty"`
 	Role    string `json:"role,omitempty"`
@@ -36,7 +54,7 @@ type OpenAIStreamChunk struct {
 	Created int64  `json:"created"`
 	Model   string `json:"model"`
 	Choices []struct {
-		Delta        Delta  `json:"delta"` // 使用定义好的Delta类型
+		Delta        Delta  `json:"delta"`
 		FinishReason string `json:"finish_reason,omitempty"`
 	} `json:"choices"`
 }
@@ -62,13 +80,65 @@ type OpenAIResponse struct {
 	} `json:"usage,omitempty"`
 }
 
-func initConfig() {
-	viper.SetConfigName("config")
-	viper.SetConfigType("yaml")
-	viper.AddConfigPath(".")
-	if err := viper.ReadInConfig(); err != nil {
-		panic(fmt.Errorf("读取配置文件失败: %s", err))
+// 获取环境变量，若不存在则返回默认值
+func getEnv(key, defaultValue string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue
 	}
+	return value
+}
+
+// 初始化配置（从环境变量读取）
+func initConfig() {
+	// 1. Token服务配置
+	config.TokenURL = getEnv("TOKEN_URL", "http://localhost:8000/api/get-jwt")
+	config.TokenMethod = getEnv("TOKEN_METHOD", "POST")
+	// 新增：token_type的值（默认SESSION_TOKEN）
+	config.TokenPayloadTokenType = getEnv("TOKEN_PAYLOAD_TOKEN_TYPE", "SESSION_TOKEN")
+	// 解析超时时间（默认5秒）
+	tokenTimeoutStr := getEnv("TOKEN_TIMEOUT", "5s")
+	timeout, err := time.ParseDuration(tokenTimeoutStr)
+	if err != nil {
+		fmt.Printf("TOKEN_TIMEOUT格式错误，使用默认值5s: %s\n", err)
+		config.TokenTimeout = 5 * time.Second
+	} else {
+		config.TokenTimeout = timeout
+	}
+
+	// 2. 目标服务配置
+	config.TargetURL = getEnv("TARGET_URL", "http://localhost:8001/api/ai-call")
+	config.TargetMethod = getEnv("TARGET_METHOD", "POST")
+
+	// 3. 默认请求体参数
+	config.DefaultUser = getEnv("DEFAULT_USER", "ai_model_user")
+	maxTokenStr := getEnv("DEFAULT_MAX_TOKEN", "2000")
+	maxToken, err := strconv.Atoi(maxTokenStr)
+	if err != nil {
+		fmt.Printf("DEFAULT_MAX_TOKEN格式错误，使用默认值2000: %s\n", err)
+		config.DefaultMaxToken = 2000
+	} else {
+		config.DefaultMaxToken = maxToken
+	}
+
+	// 4. 代理服务配置
+	config.ServerPort = getEnv("SERVER_PORT", "8080")
+	serverTimeoutStr := getEnv("SERVER_TIMEOUT", "10s")
+	serverTimeout, err := time.ParseDuration(serverTimeoutStr)
+	if err != nil {
+		fmt.Printf("SERVER_TIMEOUT格式错误，使用默认值10s: %s\n", err)
+		config.ServerTimeout = 10 * time.Second
+	} else {
+		config.ServerTimeout = serverTimeout
+	}
+
+	// 打印配置（调试用，生产环境可注释）
+	fmt.Println("=== 代理服务配置 ===")
+	fmt.Printf("TokenURL: %s\n", config.TokenURL)
+	fmt.Printf("TokenPayloadTokenType: %s\n", config.TokenPayloadTokenType)
+	fmt.Printf("TargetURL: %s\n", config.TargetURL)
+	fmt.Printf("ServerPort: %s\n", config.ServerPort)
+	fmt.Println("====================")
 }
 
 // 生成随机字符串（UUID v4）
@@ -76,25 +146,33 @@ func generateRandomString() string {
 	return uuid.New().String()
 }
 
-// 实时获取JWT Token
+// 实时获取JWT Token（新增JSON payload）
 func getJWTToken() (string, error) {
-	tokenURL := viper.GetString("token.url")
-	tokenMethod := viper.GetString("token.method")
-	tokenTimeout := viper.GetDuration("token.timeout")
+	// 构建Token请求的JSON payload
+	tokenPayload := map[string]string{
+		"token_type": config.TokenPayloadTokenType, // 核心：添加token_type字段
+	}
+	payloadBytes, err := json.Marshal(tokenPayload)
+	if err != nil {
+		return "", fmt.Errorf("序列化Token请求体失败: %s", err)
+	}
 
-	req, err := http.NewRequest(tokenMethod, tokenURL, nil)
+	// 构建Token请求（带payload）
+	req, err := http.NewRequest(config.TokenMethod, config.TokenURL, bytes.NewBuffer(payloadBytes))
 	if err != nil {
 		return "", fmt.Errorf("构建Token请求失败: %s", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", "application/json") // 确保Content-Type正确
 
-	client.Timeout = tokenTimeout
+	// 发送Token请求
+	client.Timeout = config.TokenTimeout
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("请求Token失败: %s", err)
 	}
 	defer resp.Body.Close()
 
+	// 解析Token响应
 	var tokenResp map[string]interface{}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -104,6 +182,7 @@ func getJWTToken() (string, error) {
 		return "", fmt.Errorf("解析Token响应失败（响应体：%s）: %s", string(body), err)
 	}
 
+	// 兼容多字段名
 	var token string
 	if t, ok := tokenResp["token"]; ok {
 		token = t.(string)
@@ -123,7 +202,7 @@ func getJWTToken() (string, error) {
 
 // 将目标服务响应转换为OpenAI格式（非流式）
 func convertToOpenAIResponse(targetResp []byte, model string) ([]byte, error) {
-	// 解析目标服务响应（假设目标响应格式：{"content":"xxx","finish_reason":"stop"}）
+	// 解析目标服务响应
 	var targetData map[string]interface{}
 	if err := json.Unmarshal(targetResp, &targetData); err != nil {
 		return nil, fmt.Errorf("解析目标响应失败: %s", err)
@@ -157,7 +236,7 @@ func convertToOpenAIResponse(targetResp []byte, model string) ([]byte, error) {
 		},
 	}
 
-	// 可选：添加Usage字段（若目标服务返回token统计）
+	// 可选：添加Usage字段
 	if promptTokens, ok := targetData["prompt_tokens"]; ok {
 		openAIResp.Usage.PromptTokens, _ = strconv.Atoi(fmt.Sprintf("%v", promptTokens))
 	}
@@ -187,11 +266,11 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, model string) err
 	created := time.Now().Unix()
 
 	for {
-		// 读取一行（SSE格式：data: {"content":"xxx"}\n\n）
+		// 读取一行
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
-				// 发送结束chunk（修复类型不匹配问题）
+				// 发送结束chunk
 				finishChunk := OpenAIStreamChunk{
 					ID:      chunkID,
 					Object:  "chat.completion.chunk",
@@ -202,7 +281,7 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, model string) err
 						FinishReason string `json:"finish_reason,omitempty"`
 					}{
 						{
-							Delta:        Delta{}, // 使用定义好的Delta空结构体
+							Delta:        Delta{},
 							FinishReason: "stop",
 						},
 					},
@@ -231,7 +310,7 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, model string) err
 			continue
 		}
 
-		// 转换为OpenAI chunk格式（修复类型不匹配）
+		// 转换为OpenAI chunk格式
 		openAIChunk := OpenAIStreamChunk{
 			ID:      chunkID,
 			Object:  "chat.completion.chunk",
@@ -242,7 +321,7 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, model string) err
 				FinishReason string `json:"finish_reason,omitempty"`
 			}{
 				{
-					Delta: Delta{ // 使用定义好的Delta类型赋值
+					Delta: Delta{
 						Content: fmt.Sprintf("%v", targetChunk["content"]),
 						Role:    "assistant",
 					},
@@ -293,13 +372,11 @@ func openaiProxyHandler(c *gin.Context) {
 	}
 
 	// 3. 补充默认参数
-	defaultUser := viper.GetString("default_payload.user")
-	defaultMaxToken := viper.GetInt("default_payload.max_token")
 	if _, ok := openaiRequest["user"]; !ok {
-		openaiRequest["user"] = defaultUser
+		openaiRequest["user"] = config.DefaultUser
 	}
 	if _, ok := openaiRequest["max_token"]; !ok {
-		openaiRequest["max_tokens"] = defaultMaxToken
+		openaiRequest["max_tokens"] = config.DefaultMaxToken
 	}
 
 	// 4. 获取模型名和流式标识
@@ -325,9 +402,7 @@ func openaiProxyHandler(c *gin.Context) {
 	}
 
 	// 6. 构建目标请求
-	targetURL := viper.GetString("target.url")
-	targetMethod := viper.GetString("target.method")
-	req, err := http.NewRequest(targetMethod, targetURL, bytes.NewBuffer(payloadBytes))
+	req, err := http.NewRequest(config.TargetMethod, config.TargetURL, bytes.NewBuffer(payloadBytes))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": gin.H{
@@ -346,8 +421,7 @@ func openaiProxyHandler(c *gin.Context) {
 	req.Header.Set("Content-Type", "application/json")
 
 	// 8. 转发请求
-	targetTimeout := viper.GetDuration("server.timeout")
-	client.Timeout = targetTimeout
+	client.Timeout = config.ServerTimeout
 	resp, err := client.Do(req)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{
@@ -362,7 +436,6 @@ func openaiProxyHandler(c *gin.Context) {
 
 	// 9. 处理响应（流式/非流式）
 	if isStream {
-		// 流式响应：实时转换并透传
 		if err := handleStreamResponse(c, resp, model); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"error": gin.H{
@@ -407,7 +480,10 @@ func healthCheckHandler(c *gin.Context) {
 }
 
 func main() {
+	// 初始化配置（从环境变量）
 	initConfig()
+
+	// 初始化Gin引擎
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
 
@@ -416,12 +492,11 @@ func main() {
 	r.POST("/chat/completions", openaiProxyHandler)
 
 	// 启动服务
-	port := viper.GetString("server.port")
-	fmt.Printf("OpenAI兼容代理服务启动成功 | 端口：%s\n", port)
-	fmt.Printf("接口：POST http://0.0.0.0:%s/chat/completions\n", port)
-	fmt.Printf("健康检查：GET http://0.0.0.0:%s/health\n", port)
+	fmt.Printf("OpenAI兼容代理服务启动成功 | 端口：%s\n", config.ServerPort)
+	fmt.Printf("接口：POST http://0.0.0.0:%s/chat/completions\n", config.ServerPort)
+	fmt.Printf("健康检查：GET http://0.0.0.0:%s/health\n", config.ServerPort)
 
-	if err := r.Run(":" + port); err != nil {
+	if err := r.Run(":" + config.ServerPort); err != nil {
 		panic(fmt.Errorf("启动服务失败: %s", err))
 	}
 }
